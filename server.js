@@ -32,8 +32,8 @@ dotenv.config();
 const CSV_PATH = path.join(__dirname, "../biofugitive-app-frontend/public/person_dataset.csv");
 
 // Fingerprint matching configuration
-const FINGERPRINT_DB_DIR = path.join(__dirname, "../../new/fingerprints/db");
-const FINGERPRINT_JAR = path.join(__dirname, "../../new/project-root/target/fingerprint-matcher-1.0-SNAPSHOT.jar");
+const FINGERPRINT_DB_DIR = path.join(__dirname, "../../fingerprints/db");
+const FINGERPRINT_JAR = path.join(__dirname, "../../project-root/target/fingerprint-matcher-1.0-SNAPSHOT.jar");
 const TEMP_DIR = path.join(__dirname, "temp");
 
 // Face recognition configuration (DeepFace)
@@ -47,7 +47,9 @@ if (!fs.existsSync(TEMP_DIR)) {
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// Increase payload limit for fingerprint and face images (base64 encoded)
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // Connect to MongoDB
 mongoose
@@ -517,9 +519,12 @@ app.post("/fingerprint-match", async (req, res) => {
     // Check if Java JAR exists
     if (!fs.existsSync(FINGERPRINT_JAR)) {
       console.error("Fingerprint matcher JAR not found at:", FINGERPRINT_JAR);
-      return res.status(500).json({ 
-        message: "Fingerprint matching service not available. JAR file not found.",
-        path: FINGERPRINT_JAR
+      console.error("Expected path:", path.resolve(FINGERPRINT_JAR));
+      return res.status(503).json({ 
+        message: "Fingerprint matching service is currently unavailable. The fingerprint matching library (JAR) is not installed.",
+        matchFound: false,
+        errorType: 'SERVICE_UNAVAILABLE',
+        note: "Please contact the administrator to install the fingerprint matching service."
       });
     }
 
@@ -567,28 +572,44 @@ app.post("/fingerprint-match", async (req, res) => {
       
       if (fileNameParts.length >= 1) {
         // Try to find person in CSV by matching filename pattern
-        const persons = await loadPersonsFromCSV();
-        for (const person of persons) {
-          for (const finger of person.fingers || []) {
-            if (finger.filename === bestMatch.fileName) {
-              personInfo = {
-                personId: person.personId,
-                name: person.name,
-                gender: person.gender,
-                age: person.age,
-                address: person.address,
-                aadhaar: person.aadhaar,
-                matchedFinger: {
-                  hand: finger.hand,
-                  finger: finger.finger,
-                }
-              };
-              break;
+        try {
+          const persons = await loadPersonsFromCSV();
+          for (const person of persons) {
+            for (const finger of person.fingers || []) {
+              if (finger.filename === bestMatch.fileName) {
+                personInfo = {
+                  personId: person.personId,
+                  name: person.name,
+                  gender: person.gender,
+                  age: person.age,
+                  address: person.address,
+                  aadhaar: person.aadhaar,
+                  matchedFinger: {
+                    hand: finger.hand,
+                    finger: finger.finger,
+                  }
+                };
+                break;
+              }
             }
+            if (personInfo) break;
           }
-          if (personInfo) break;
+        } catch (csvError) {
+          console.error('Error loading persons from CSV:', csvError.message);
+          // Continue without person info - will return basic match data
         }
       }
+
+      // Log audit trail
+      await logAudit('FINGERPRINT_MATCH', 
+        req.body.userId || 'unknown', 
+        personInfo ? personInfo.name : 'unknown', 
+        'person', 
+        personInfo ? personInfo.personId : null, 
+        personInfo ? personInfo.name : null, 
+        `Fingerprint match found: ${bestMatch.fileName} (score: ${bestMatch.score})`, 
+        { score: bestMatch.score, matchedFile: bestMatch.fileName }, 
+        'success');
 
       res.status(200).json({
         matchFound: true,
@@ -602,6 +623,17 @@ app.post("/fingerprint-match", async (req, res) => {
       const bestScore = matchResults.length > 0 ? matchResults[0].score : 0;
       console.log(`No match found. Best score: ${bestScore}, Total checked: ${matchResults.length}`);
       
+      // Log audit trail
+      await logAudit('FINGERPRINT_SCAN', 
+        req.body.userId || 'unknown', 
+        req.body.userId || 'unknown', 
+        'system', 
+        null, 
+        null, 
+        'Fingerprint scan - no match found', 
+        { bestScore, totalChecked: matchResults.length }, 
+        'success');
+
       res.status(200).json({
         matchFound: false,
         bestScore: bestScore,
@@ -1548,8 +1580,8 @@ app.post("/face-match", async (req, res) => {
         };
       }
 
-      await logAudit('FACE_MATCH', req.body.userId, matchedPerson.personId, 'person', null, null, 
-        `Face match found: ${matchedPerson.name} (confidence: ${deepfaceResult.confidence}%)`);
+      await logAudit('FACE_MATCH', req.body.userId || 'unknown', matchedPerson.name || matchedPerson.personId, 'person', matchedPerson.personId, matchedPerson.name, 
+        `Face match found: ${matchedPerson.name} (confidence: ${deepfaceResult.confidence}%)`, {}, 'success');
 
       return res.status(200).json({
         matchFound: true,
@@ -1562,7 +1594,7 @@ app.post("/face-match", async (req, res) => {
         message: `Match found: ${matchedPerson.name}`
       });
     } else {
-      await logAudit('FACE_SCAN', req.body.userId, req.body.userId, 'system', null, null, 'Face scan - no match found');
+      await logAudit('FACE_SCAN', req.body.userId || 'unknown', req.body.userId || 'unknown', 'system', null, null, 'Face scan - no match found', {}, 'success');
 
       return res.status(200).json({
         matchFound: false,
